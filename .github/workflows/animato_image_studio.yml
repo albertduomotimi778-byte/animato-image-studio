@@ -1,0 +1,100 @@
+# Animato image studio — keeps the picture model loaded so every picture takes seconds.
+#
+# Installed and kept up to date automatically by the Animato app. Started by the app when
+# someone opens Tools -> Image generation; it draws the pictures the app sends, then closes
+# itself after a few idle minutes.
+
+name: Animato Image Studio
+
+run-name: "Animato image studio"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: App URL (set by the app)
+        type: string
+        default: ''
+      session_token:
+        description: Session secret (set by the app)
+        type: string
+        default: ''
+      idle_minutes:
+        description: Close after this many idle minutes
+        type: string
+        default: '12'
+      warmup:
+        description: Only download and cache the model
+        type: string
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: animato-image-studio
+  cancel-in-progress: false
+
+jobs:
+  studio:
+    name: Image studio
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Hide the session secret
+        run: echo "::add-mask::${{ inputs.session_token }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the image generator (model + Python environment)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/imagegen-venv
+            ~/.cache/huggingface
+            ~/.cache/animato-imagegen
+          key: animato-imagegen-v4-${{ runner.os }}-py${{ steps.py.outputs.python-version }}
+
+      - name: Set up the image generator
+        run: |
+          set -e
+          VENV="$HOME/imagegen-venv"
+          # A cached venv only works if the Python it was built from still exists on this runner
+          # (bin/python is a symlink into the runner's tool cache). If not, throw it away and rebuild.
+          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import torch, diffusers" >/dev/null 2>&1; then
+            echo "::warning::cached image generator environment is stale or broken - rebuilding it"
+            rm -rf "$VENV"
+          fi
+          if [ ! -f "$VENV/.ready-v4" ]; then
+            rm -rf "$VENV"
+            python -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
+            # Pinned to versions known to work together on CPU (the newest releases have broken this before).
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check "diffusers>=0.37.0,<0.40" "transformers>=4.51.0,<4.58.0" "accelerate>=1.12.0" safetensors "peft>=0.18.0" pillow "numpy<2.4" huggingface_hub
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check spandrel || echo "::warning::spandrel could not be installed - the picture uses the plain resize"
+            "$VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download('IDKiro/sdxs-512-dreamshaper')" || echo "::warning::model pre-download failed - it downloads when the picture is drawn"
+            touch "$VENV/.ready-v4"
+          fi
+          "$VENV/bin/python" -c "import torch, diffusers; print('image generator ready: torch', torch.__version__, 'diffusers', diffusers.__version__)"
+
+      - name: Draw pictures for the app
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          SESSION_TOKEN: ${{ inputs.session_token }}
+          IDLE_MINUTES: ${{ inputs.idle_minutes }}
+        run: |
+          mkdir -p output
+          if [ "${{ inputs.warmup }}" = "true" ]; then
+            "$HOME/imagegen-venv/bin/python" animato-cloud/imagegen.py studio --warmup
+          else
+            "$HOME/imagegen-venv/bin/python" animato-cloud/imagegen.py studio
+          fi

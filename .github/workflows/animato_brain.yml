@@ -1,0 +1,107 @@
+# Animato AI Brain — the app's own AI, running on this GitHub runner (no API keys).
+#
+# Installed and kept up to date automatically by the Animato app; started by the app
+# when someone talks to the assistant or anything in the app needs AI. It keeps the
+# models loaded and answers the app's queued requests, then stops by itself after a
+# few idle minutes:
+#   • Qwen3-4B-Instruct (llama.cpp)         — chat, writing, plans, lyrics
+#   • Qwen2.5-VL-3B-Instruct + mmproj       — looking at pictures (loaded on first use)
+#   • Whisper small (faster-whisper)        — speech → text
+#   • Piper neural voices                   — text → speech
+# The runner cannot be reached from outside, so it polls the app (animato-cloud/brain.py).
+
+name: Animato AI Brain
+run-name: "Animato AI brain session"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: App URL (the brain polls it for work)
+        type: string
+        required: true
+      session_token:
+        description: Session secret (set by the app)
+        type: string
+        required: true
+      idle_minutes:
+        description: Stop after this many idle minutes
+        type: string
+        default: '12'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: animato-brain
+  cancel-in-progress: true
+
+jobs:
+  brain:
+    name: AI brain session
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Hide the session secret
+        run: echo "::add-mask::${{ inputs.session_token }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: animato-cloud
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the AI model
+        uses: actions/cache@v4
+        with:
+          path: ~/animato-llm
+          key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
+
+      - name: Cache the speech models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/brain-venv
+            ~/animato-voices
+            ~/.cache/huggingface
+          key: animato-brain-speech-v1-${{ runner.os }}-py${{ steps.py.outputs.python-version }}
+
+      - name: Start the language model
+        run: bash animato-cloud/llm_server.sh
+
+      - name: Set up speech (Whisper + Piper)
+        run: |
+          set -e
+          VENV="$HOME/brain-venv"
+          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import faster_whisper, piper" >/dev/null 2>&1; then rm -rf "$VENV"; fi
+          if [ ! -f "$VENV/.ready-v1" ]; then
+            python -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check faster-whisper piper-tts requests numpy
+            "$VENV/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8')"
+            touch "$VENV/.ready-v1"
+          fi
+          mkdir -p "$HOME/animato-voices"
+          for v in "hfc_female/medium/en_US-hfc_female-medium" "ryan/medium/en_US-ryan-medium" "amy/medium/en_US-amy-medium"; do
+            f="$HOME/animato-voices/$(basename "$v").onnx"
+            if [ ! -s "$f" ]; then
+              curl -fsSL --retry 3 -o "$f" "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/$v.onnx" || rm -f "$f"
+              curl -fsSL --retry 3 -o "$f.json" "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/$v.onnx.json" || rm -f "$f.json"
+            fi
+          done
+          ls -la "$HOME/animato-voices"
+
+      - name: Serve the app
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          BRAIN_TOKEN: ${{ inputs.session_token }}
+          IDLE_MINUTES: ${{ inputs.idle_minutes }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          "$HOME/brain-venv/bin/python" animato-cloud/brain.py

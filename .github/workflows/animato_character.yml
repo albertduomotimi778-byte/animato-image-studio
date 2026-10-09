@@ -1,0 +1,183 @@
+# Animato AI Character Rig — generate one detailed character or dissect a user image,
+# then turn it into transparent animation layers. Installed by the Animato pipeline bundle.
+#
+# Speed: one cached environment holds the cut-out, face-parsing and pose models (ONNX)
+# plus the app's own image model (DreamShaper-8 LCM, the "detailed" imagegen profile).
+# The image model loads in the background while the character is cut out, then repaints
+# the mouth shapes / closed eyes / hand poses in place, in fast 4-step batches.
+# Every face gets eyes, brows and a talking mouth: face parser -> 68 face landmarks ->
+# colour detection -> face proportions. Typical import: about 2 minutes. "generate" mode first draws the character with the same model.
+name: Animato AI Character Rig
+run-name: "Animato character ${{ inputs.request_id || inputs.mode }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: generate = DreamShaper character; upload = dissect user image
+        type: choice
+        default: generate
+        options: [generate, upload]
+      prompt:
+        description: Character prompt (used for generate mode)
+        type: string
+        default: "realistic young woman, front-facing, neutral expression, natural skin, detailed eyes and hair"
+      source_asset_id:
+        description: SHA-1 asset id uploaded to Animato (used for upload mode)
+        type: string
+        default: ''
+      app_url:
+        description: Animato app URL used to download an uploaded reference image
+        type: string
+        required: true
+      gender:
+        description: Character gender
+        type: choice
+        default: female
+        options: [female, male]
+      full_body:
+        description: Generate/use a full-body character
+        type: choice
+        default: 'false'
+        options: ['true', 'false']
+      plan_json:
+        description: JSON design plan produced by Animato's existing AI planner
+        type: string
+        default: '{}'
+      seed:
+        description: Reproducible generation seed
+        type: string
+        default: '1'
+      request_id:
+        description: Set by the app to find this run
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  rig:
+    name: Build animation-ready character
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: animato-cloud
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache AI character engine
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/character-venv
+            ~/.cache/animato-character
+            ~/.cache/rtmlib
+            ~/.cache/huggingface
+            ~/.cache/animato-imagegen
+            ~/.u2net
+          key: animato-character-v8-${{ runner.os }}-py${{ steps.py.outputs.python-version }}
+
+      - name: Set up AI character engine
+        run: |
+          set -e
+          VENV="$HOME/character-venv"
+          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import torch, diffusers, onnxruntime, rembg, cv2, rtmlib" >/dev/null 2>&1; then rm -rf "$VENV"; fi
+          if [ ! -f "$VENV/.ready-v8" ]; then
+            rm -rf "$VENV"
+            python -m venv "$VENV"
+            PIP="$VENV/bin/pip --quiet --disable-pip-version-check"
+            $PIP install --upgrade pip
+            # The app's image model (same stack as imagegen.py), CPU build.
+            $PIP install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+            $PIP install diffusers transformers accelerate safetensors peft
+            $PIP install spandrel || true
+            $PIP install onnxruntime rembg opencv-python-headless pillow numpy huggingface_hub tqdm
+            # RTMPose body keypoints on onnxruntime (no PyTorch). --no-deps keeps the headless OpenCV.
+            $PIP install --no-deps rtmlib
+            $PIP uninstall -y opencv-python opencv-contrib-python >/dev/null 2>&1 || true
+            $PIP install --force-reinstall --no-deps opencv-python-headless
+            mkdir -p "$HOME/.cache/animato-character"
+            "$VENV/bin/python" -c "from huggingface_hub import hf_hub_download; hf_hub_download('PayamFard123/dermaintel-face-parsing', 'resnet18.onnx', cache_dir='$HOME/.cache/animato-character')"
+            for m in isnet-anime u2net_human_seg isnet-general-use; do "$VENV/bin/python" -c "from rembg import new_session; new_session('$m')" || echo "::warning::cut-out model $m pre-download failed"; done
+            "$VENV/bin/python" -c "from rtmlib import Body; Body(mode='balanced', backend='onnxruntime', device='cpu')" || echo "::warning::pose model pre-download failed"
+            # Whole-body keypoints incl. 68 face landmarks: finds the eyes / brows / lips on
+            # 3D, cartoon and anime faces the photo-trained face parser misses.
+            "$VENV/bin/python" -c "from rtmlib import Wholebody; Wholebody(mode='balanced', backend='onnxruntime', device='cpu')" || echo "::warning::face landmark model pre-download failed"
+            "$VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download('Lykon/dreamshaper-8-lcm')" || echo "::warning::image model pre-download failed - it downloads during the job"
+            touch "$VENV/.ready-v8"
+          fi
+          "$VENV/bin/python" -c "import torch, diffusers, onnxruntime, cv2; print('character engine ready', torch.__version__, diffusers.__version__, cv2.__version__)"
+
+      # ---- generate mode only: the app's detailed DreamShaper draws one character ----
+      - name: Generate detailed base character
+        if: inputs.mode == 'generate'
+        env:
+          IMG_PROMPT: ${{ inputs.prompt }}
+          PLAN: ${{ inputs.plan_json }}
+          IMG_SEED: ${{ inputs.seed }}
+          IMG_FULL: ${{ inputs.full_body }}
+        run: |
+          set -e
+          mkdir -p input
+          python - <<'PY'
+          import json, os
+          try: p=json.loads(os.environ.get('PLAN','{}'))
+          except: p={}
+          prompt=p.get('render_prompt') or os.environ.get('IMG_PROMPT','')
+          framing='full body, head to toe' if os.environ.get('IMG_FULL')=='true' else 'waist-up portrait'
+          prompt=("front-facing, centered single person, neutral relaxed expression, mouth closed, symmetrical camera view, " + framing + ", plain light studio background, no props, no text, " + prompt)[:1200]
+          job={"prompt":prompt,"profile":"detail","mode":"","style":"photorealistic character portrait, natural skin texture, realistic eyes, clean studio lighting","width":768,"height":1024,"seed":int(os.environ.get('IMG_SEED') or '1'),"out":"input/generated.png"}
+          json.dump(job,open('job.json','w'))
+          PY
+          "$HOME/character-venv/bin/python" animato-cloud/imagegen.py batch --jobs job.json
+
+      # ---- upload mode ----
+      - name: Download uploaded reference image
+        if: inputs.mode == 'upload'
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          ASSET_ID: ${{ inputs.source_asset_id }}
+        run: |
+          set -e
+          mkdir -p input
+          url="${APP_URL%/}/api/automation/assets/${ASSET_ID}"
+          curl --fail --location --retry 4 --retry-delay 2 --max-time 120 -o input/source.img "$url"
+          test -s input/source.img
+
+      - name: Dissect, restore and rig the character
+        timeout-minutes: 12
+        env:
+          PYTHONUNBUFFERED: '1'
+          MODE: ${{ inputs.mode }}
+          GENDER: ${{ inputs.gender }}
+          FULL_BODY: ${{ inputs.full_body }}
+          PLAN: ${{ inputs.plan_json }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          set -e
+          mkdir -p output/rig
+          export CHARACTER_CACHE="$HOME/.cache/animato-character"
+          # The app's DreamShaper-8 LCM repaints the variants in place (4-step batches).
+          export CHARACTER_EDIT_MODEL=Lykon/dreamshaper-8-lcm
+          export CHARACTER_EDIT_SIZE=320
+          export CHARACTER_EDIT_STEPS=4
+          export CHARACTER_EDIT_BATCH=4
+          if [ "$MODE" = "generate" ]; then SRC=input/generated.png; else SRC=input/source.img; fi
+          "$HOME/character-venv/bin/python" animato-cloud/character_pipeline.py --input "$SRC" --output output/rig --mode "$MODE" --gender "$GENDER" $([ "$FULL_BODY" = "true" ] && echo --full-body) --seed "${SEED:-1}" --plan "$PLAN"
+
+      - name: Attach character rig
+        uses: actions/upload-artifact@v4
+        with:
+          name: animato-character-${{ github.run_id }}
+          path: output/rig
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 1

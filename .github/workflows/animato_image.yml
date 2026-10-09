@@ -1,0 +1,153 @@
+# Animato image generator — draws one picture on the runner's CPU (no API keys).
+#
+# Installed and kept up to date automatically by the Animato app.
+# Edits made here are overwritten on the next update; change
+# server/bootstrap/image.yml in the app instead.
+#
+# Used by Tools -> Image generation in the app (test a prompt and see the quality) and
+# runnable by hand from the Actions tab. It uses the same generator
+# (animato-cloud/imagegen.py) as the video render, so results look the same.
+# The picture is attached to the run as the "animato-image-<run id>" artifact.
+
+name: Animato Image Generator
+
+run-name: "Animato image ${{ inputs.request_id || inputs.prompt }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: What to draw
+        type: string
+        required: true
+        default: A cute fox cub and a little girl sharing an umbrella in a rainy village at sunset
+      profile:
+        description: Model (character = default, classic = first version, anime, detail = slower and more detailed)
+        type: choice
+        default: character
+        options:
+          - character
+          - classic
+          - anime
+          - detail
+      story_mode:
+        description: Story mode (calm medium-shot framing + the cartoon story style, exactly like the video render)
+        type: choice
+        default: 'true'
+        options:
+          - 'true'
+          - 'false'
+      style:
+        description: Optional style prefix (empty = the story style in story mode)
+        type: string
+        default: ''
+      width:
+        description: Output width in pixels
+        type: string
+        default: '1152'
+      height:
+        description: Output height in pixels
+        type: string
+        default: '1152'
+      seed:
+        description: Seed (same prompt + seed + model = same picture)
+        type: string
+        default: '1'
+      request_id:
+        description: Set by the app to find this run
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Draw the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the image generator (model + Python environment)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/imagegen-venv
+            ~/.cache/huggingface
+            ~/.cache/animato-imagegen
+          key: animato-imagegen-v4-${{ runner.os }}-py${{ steps.py.outputs.python-version }}
+
+      - name: Set up the image generator
+        run: |
+          set -e
+          VENV="$HOME/imagegen-venv"
+          # A cached venv only works if the Python it was built from still exists on this runner
+          # (bin/python is a symlink into the runner's tool cache). If not, throw it away and rebuild.
+          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import torch, diffusers" >/dev/null 2>&1; then
+            echo "::warning::cached image generator environment is stale or broken - rebuilding it"
+            rm -rf "$VENV"
+          fi
+          if [ ! -f "$VENV/.ready-v4" ]; then
+            rm -rf "$VENV"
+            python -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
+            # Pinned to versions known to work together on CPU (the newest releases have broken this before).
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cpu
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check "diffusers>=0.37.0,<0.40" "transformers>=4.51.0,<4.58.0" "accelerate>=1.12.0" safetensors "peft>=0.18.0" pillow "numpy<2.4" huggingface_hub
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check spandrel || echo "::warning::spandrel could not be installed - the picture uses the plain resize"
+            "$VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download('IDKiro/sdxs-512-dreamshaper')" || echo "::warning::model pre-download failed - it downloads when the picture is drawn"
+            touch "$VENV/.ready-v4"
+          fi
+          "$VENV/bin/python" -c "import torch, diffusers; print('image generator ready: torch', torch.__version__, 'diffusers', diffusers.__version__)"
+
+      - name: Draw the image
+        env:
+          # Everything is passed as environment data, never pasted into code, so quotes in a prompt are harmless.
+          IMG_PROMPT: ${{ inputs.prompt }}
+          IMG_PROFILE: ${{ inputs.profile }}
+          IMG_STORY: ${{ inputs.story_mode }}
+          IMG_STYLE: ${{ inputs.style }}
+          IMG_WIDTH: ${{ inputs.width }}
+          IMG_HEIGHT: ${{ inputs.height }}
+          IMG_SEED: ${{ inputs.seed }}
+        run: |
+          mkdir -p output
+          python - <<'PY'
+          import json, os
+          def num(name, default, lo, hi):
+              try:
+                  return max(lo, min(hi, int(float(os.environ.get(name) or default))))
+              except ValueError:
+                  return default
+          job = {
+              "prompt": os.environ["IMG_PROMPT"][:600],
+              "profile": os.environ.get("IMG_PROFILE") or "character",
+              "mode": "story" if os.environ.get("IMG_STORY", "true") == "true" else "",
+              "style": os.environ.get("IMG_STYLE", "")[:300],
+              "width": num("IMG_WIDTH", 1152, 256, 2048),
+              "height": num("IMG_HEIGHT", 1152, 256, 2048),
+              "seed": num("IMG_SEED", 1, 0, 2**32 - 1),
+              "out": "output/image.png",
+          }
+          json.dump(job, open("job.json", "w"))
+          PY
+          "$HOME/imagegen-venv/bin/python" animato-cloud/imagegen.py batch --jobs job.json
+
+      - name: Attach the image to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: animato-image-${{ github.run_id }}
+          path: |
+            output/image.png
+            output/image.json
+          retention-days: 3
+          if-no-files-found: error

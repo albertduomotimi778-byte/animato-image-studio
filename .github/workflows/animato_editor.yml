@@ -1,0 +1,106 @@
+# Animato — AI Auto Video Editor.
+#
+# Installed and kept up to date automatically by the Animato app.
+# One run edits ONE upload: transcribe the voice, cut fillers / retakes /
+# dead air, match the video to what is said and compile the final MP4 with
+# the captions drawn onto the picture.
+
+name: Animato AI Video Editor
+
+run-name: "Animato editor · ${{ github.event.client_payload.job.title || (github.event_name == 'workflow_dispatch' && 'warm-up') || 'video' }} [${{ github.event.client_payload.job_id || 'manual' }}]"
+
+on:
+  repository_dispatch:
+    types: [edit_video]
+  # The app runs this once when the account is prepared, so the AI model and speech-to-text are
+  # downloaded and cached before the first real edit.
+  workflow_dispatch:
+    inputs:
+      warmup:
+        description: 'Only download and cache the tools'
+        required: false
+        default: 'true'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: animato-editor-${{ github.event.client_payload.job_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  edit:
+    name: Edit video
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout (the editor only)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: animato-cloud
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Python (speech-to-text)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FFmpeg
+        run: |
+          # Skip the slow package-list refresh when the runner's lists are fresh enough.
+          if ! command -v ffmpeg > /dev/null; then
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null 2>&1 \
+              || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg > /dev/null; }
+          fi
+          ffmpeg -hide_banner -version | head -n 1
+          nproc
+
+      # The app's own AI model (llama.cpp + Qwen3-4B) runs on this runner: no API keys.
+      - name: Cache the AI model
+        uses: actions/cache@v4
+        with:
+          path: ~/animato-llm
+          key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
+
+      - name: Start the AI model (self-hosted)
+        run: bash animato-cloud/llm_server.sh
+
+      - name: Cache speech-to-text (Whisper)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/asr-venv
+            ~/.cache/huggingface
+          key: animato-asr-v1-${{ runner.os }}-py312
+
+      - name: Set up speech-to-text (Whisper on this runner)
+        run: |
+          VENV="$HOME/asr-venv"
+          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import faster_whisper" >/dev/null 2>&1; then rm -rf "$VENV"; fi
+          if [ ! -d "$VENV" ]; then
+            python -m venv "$VENV"
+            "$VENV/bin/pip" install -q --disable-pip-version-check --upgrade pip
+            "$VENV/bin/pip" install -q --disable-pip-version-check faster-whisper
+          fi
+          "$VENV/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('Whisper ready')" \
+            && echo "ASR_PYTHON=$VENV/bin/python" >> "$GITHUB_ENV" \
+            || echo "::warning::Whisper could not be prepared here - the editor installs it itself"
+
+      - name: Edit the video
+        if: github.event_name == 'repository_dispatch'
+        run: node --experimental-strip-types animato-cloud/editor.mts
+
+      - name: Keep the edited video as a run artifact
+        if: always() && github.event_name == 'repository_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: animato-edit-${{ github.run_id }}
+          path: |
+            output/editor/edited.mp4
+            output/editor/captions.ass
+          retention-days: 7
+          if-no-files-found: ignore

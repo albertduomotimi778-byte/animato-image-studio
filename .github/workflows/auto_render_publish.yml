@@ -1,0 +1,214 @@
+# Animato AutoPoster — cloud render & publish.
+#
+# Installed and kept up to date automatically by the Animato app.
+# Edits made here are overwritten on the next update; change
+# server/bootstrap/workflow.yml in the app instead.
+#
+# One run renders and publishes ONE episode. The app's server decides when
+# the next episode runs, so nothing here sleeps or re-triggers itself.
+
+name: Animato Auto Render & Publish
+
+run-name: "Animato · ${{ github.event.client_payload.job.name || inputs.category || 'manual run' }} · Part ${{ github.event.client_payload.part_number || inputs.part_number || '1' }} [${{ github.event.client_payload.campaign_id || inputs.campaign_id || 'manual' }}]"
+
+on:
+  # Sent by the Animato app. The payload deliberately has fewer than
+  # 10 top-level fields (GitHub rejects more with HTTP 422).
+  repository_dispatch:
+    types: [render_video]
+
+  # Manual test run from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      category:
+        description: Content category
+        type: choice
+        options: [stories, cooking, tech, news, musical]
+        default: stories
+      format:
+        description: Publish as a YouTube Short (vertical) or a regular video (landscape)
+        type: choice
+        options: [shorts, video]
+        default: shorts
+      topic:
+        description: Topic / prompt (optional)
+        type: string
+        default: ''
+      gender:
+        description: Narrator voice
+        type: choice
+        options: [female, male]
+        default: female
+      part_number:
+        description: Part / episode number
+        type: string
+        default: '1'
+      auto_post_youtube:
+        description: Publish to YouTube (automatic runs use the automation's connected channel)
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      campaign_id:
+        description: Automation ID (optional, links the run to an automation in the app)
+        type: string
+        default: ''
+      app_url:
+        description: App URL (optional, for status updates)
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time per automation; different automations run in parallel.
+  group: animato-${{ github.event.client_payload.campaign_id || inputs.campaign_id || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  render_and_publish:
+    name: Render & publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Python (for the neural voice engine)
+        id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the vocal separator (Musical automations)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/torch
+          key: animato-demucs-v1-${{ runner.os }}
+
+      - name: Cache ACE-Step (the music engine runs on this runner)
+        uses: actions/cache@v4
+        with:
+          path: ~/acestep-local
+          key: animato-acestep-local-v1-${{ runner.os }}
+
+      # Scene pictures (stories, cooking, news) are drawn on this runner by animato-cloud/imagegen.py.
+      # The Python environment and the model are cached, so after the first run this costs seconds.
+      - name: Cache the image generator (model + Python environment)
+        if: ${{ contains(fromJSON('["stories","cooking","news"]'), github.event.client_payload.job.category || inputs.category || 'stories') }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/imagegen-venv
+            ~/.cache/huggingface
+            ~/.cache/animato-imagegen
+          key: animato-imagegen-v3-${{ runner.os }}-py${{ steps.py.outputs.python-version }}
+
+      - name: Set up the image generator
+        if: ${{ contains(fromJSON('["stories","cooking","news"]'), github.event.client_payload.job.category || inputs.category || 'stories') }}
+        run: |
+          set -e
+          VENV="$HOME/imagegen-venv"
+          # A cached venv only works if the Python it was built from still exists on this runner
+          # (bin/python is a symlink into the runner's tool cache). If not, throw it away and rebuild.
+          if [ -d "$VENV" ] && ! "$VENV/bin/python" -c "import torch, diffusers" >/dev/null 2>&1; then
+            echo "::warning::cached image generator environment is stale or broken - rebuilding it"
+            rm -rf "$VENV"
+          fi
+          if [ ! -f "$VENV/.ready-v3" ]; then
+            rm -rf "$VENV"
+            python -m venv "$VENV"
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check --upgrade pip
+            # CPU-only PyTorch: small and fast to install.
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check torch torchvision --index-url https://download.pytorch.org/whl/cpu
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check diffusers transformers accelerate safetensors peft pillow numpy
+            # Optional detail upscaler: if it cannot be installed the pictures simply use a plain high-quality resize.
+            "$VENV/bin/pip" install --quiet --disable-pip-version-check spandrel || echo "::warning::spandrel could not be installed - pictures use the plain resize"
+            "$VENV/bin/python" -c "from huggingface_hub import snapshot_download; snapshot_download('IDKiro/sdxs-512-dreamshaper')" || echo "::warning::model pre-download failed - it will download when the first picture is drawn"
+            touch "$VENV/.ready-v3"
+          fi
+          echo "IMAGEGEN_PYTHON=$VENV/bin/python" >> "$GITHUB_ENV"
+          "$VENV/bin/python" -c "import torch, diffusers; print('image generator ready: torch', torch.__version__, 'diffusers', diffusers.__version__)"
+
+      # The app's own AI model (llama.cpp + Qwen3-4B) runs on this runner: no API keys.
+      - name: Cache the AI model
+        uses: actions/cache@v4
+        with:
+          path: ~/animato-llm
+          key: animato-llm-qwen3-4b-2507-q4km-v1-${{ runner.os }}
+
+      - name: Start the AI model (self-hosted)
+        run: bash animato-cloud/llm_server.sh
+
+      # Studio animations made from the user's own voice: speech recognition (installed on first use).
+      - name: Cache speech recognition
+        uses: actions/cache@v4
+        with:
+          path: ~/asr-venv
+          key: animato-asr-venv-v1-${{ runner.os }}
+
+      - name: Install FFmpeg, fonts and voice engine
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core fonts-noto-cjk > /dev/null
+          python -m pip install --quiet --disable-pip-version-check edge-tts
+          ffmpeg -hide_banner -version | head -n 1
+          edge-tts --help > /dev/null && echo "edge-tts ready"
+
+      - name: Check Chrome (draws the animated character)
+        run: |
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || true)"
+          if [ -z "$CHROME" ]; then
+            echo "Chrome is not preinstalled on this runner - installing Chrome for Testing"
+            npx --yes @puppeteer/browsers@2 install chrome@stable --path "$HOME/.cache/puppeteer" > chrome-install.log 2>&1 || cat chrome-install.log
+            CHROME="$(find "$HOME/.cache/puppeteer/chrome" -path '*chrome-linux64/chrome' -type f 2>/dev/null | head -n 1)"
+          fi
+          if [ -n "$CHROME" ]; then
+            echo "CHROME_PATH=$CHROME" >> "$GITHUB_ENV"
+            "$CHROME" --version || true
+          else
+            echo "::warning::Chrome is unavailable - the video will render without the animated character."
+          fi
+
+      - name: Render & publish episode
+        env:
+          # Secrets come from the app's dispatch payload (read inside the script
+          # from the event file and masked). These repository secrets are only
+          # a fallback for manual runs.
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          # Auto runs get their refresh token only from the campaign-specific dispatch payload.
+          # Never expose the shared repository refresh token to repository_dispatch runs,
+          # otherwise a missing payload token could silently route to another channel.
+          YOUTUBE_REFRESH_TOKEN: ${{ github.event_name == 'workflow_dispatch' && secrets.YOUTUBE_REFRESH_TOKEN || '' }}
+          # Musical: ACE-Step 1.5 runs on this runner (no online music API). Optional: max minutes for it (default 35).
+          ACESTEP_LOCAL_MINUTES: ${{ vars.ACESTEP_LOCAL_MINUTES }}
+          # Optional: musical song length in seconds (default 50 = intro, verse, catchy chorus, outro).
+          MUSIC_SECONDS: ${{ vars.MUSIC_SECONDS }}
+          # Must match timeout-minutes above (the renderer budgets its time from it).
+          JOB_TIMEOUT_MINUTES: '90'
+          # Optional: STEM_SEPARATION=off skips the vocal/drum separation for Musical videos.
+          STEM_SEPARATION: ${{ vars.STEM_SEPARATION }}
+          # Optional: real-photo sources for news / tech / cooking / ads.
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+        run: node --experimental-strip-types animato-cloud/renderer.mts
+
+      - name: Keep the rendered video as a run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: animato-video-${{ github.run_id }}
+          path: |
+            output/rendered_video.mp4
+            output/video_metadata.json
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,0 +1,141 @@
+# Animato music generator — writes a full song (vocals + music) on the runner's CPU (no API keys).
+#
+# Installed and kept up to date automatically by the Animato app.
+# Edits made here are overwritten on the next update; change
+# server/bootstrap/music.yml in the app instead.
+#
+# Used by Tools -> Music generation in the app, and runnable by hand from the Actions tab.
+# Model: ACE-Step 1.5 turbo (MIT licence) through its own local REST server, on CPU.
+# The engine is cached (shared with the video renderer), so only the first run installs it.
+# The song is attached to the run as the "animato-music-<run id>" artifact (song.mp3 + meta.json).
+
+name: Animato Music Generator
+
+run-name: "Animato music ${{ inputs.request_id || inputs.title }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: Song title (optional)
+        type: string
+        default: ''
+      lyrics:
+        description: Lyrics ([Verse] / [Chorus] tags optional; empty = instrumental)
+        type: string
+        default: ''
+      style:
+        description: Style preset (pop, afrobeats, amapiano, hiphop, trap, rnb, gospel, highlife, reggae, dancehall, rock, edm, lofi, jazz, country, kpop, latin, cinematic, acoustic, custom)
+        type: string
+        default: pop
+      custom_style:
+        description: Extra style words (optional, e.g. "summer vibe, saxophone solo")
+        type: string
+        default: ''
+      singer:
+        description: Singer (female_pop, female_soul, female_soft, male_pop, male_deep, male_rock, male_rap, female_rap, choir, duet)
+        type: string
+        default: female_pop
+      language:
+        description: Language code (en, fr, es, pt, sw, zh, ... ; pcm = Nigerian Pidgin, unknown = auto)
+        type: string
+        default: en
+      duration:
+        description: Length in seconds (10-300; grows to fit the lyrics)
+        type: string
+        default: '60'
+      seed:
+        description: Seed (same inputs + seed = same song)
+        type: string
+        default: '1'
+      request_id:
+        description: Set by the app to find this run
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  generate:
+    name: Compose the song
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: animato-cloud
+
+      - name: Add swap (the model is large for a 16 GB runner)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          if sudo fallocate -l 8G /mnt/animato-swap 2>/dev/null && sudo chmod 600 /mnt/animato-swap && sudo mkswap /mnt/animato-swap >/dev/null && sudo swapon /mnt/animato-swap; then
+            echo "added 8 GB of swap"
+          fi
+          free -h; nproc; df -h /
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # The same engine folder the video renderer uses — installed once, shared from the cache.
+      - name: Cache the music engine
+        uses: actions/cache@v4
+        with:
+          path: ~/acestep-local
+          key: animato-acestep-local-v1-${{ runner.os }}
+
+      - name: Install the music engine (first run only)
+        run: bash animato-cloud/music_setup.sh
+
+      - name: Compose the song
+        env:
+          # Everything is passed as environment data, never pasted into code, so quotes in lyrics are harmless.
+          SONG_TITLE: ${{ inputs.title }}
+          SONG_LYRICS: ${{ inputs.lyrics }}
+          SONG_STYLE: ${{ inputs.style }}
+          SONG_CUSTOM_STYLE: ${{ inputs.custom_style }}
+          SONG_SINGER: ${{ inputs.singer }}
+          SONG_LANGUAGE: ${{ inputs.language }}
+          SONG_DURATION: ${{ inputs.duration }}
+          SONG_SEED: ${{ inputs.seed }}
+        run: |
+          mkdir -p output
+          python - <<'PY'
+          import json, os
+          def num(name, default, lo, hi):
+              try:
+                  return max(lo, min(hi, int(float(os.environ.get(name) or default))))
+              except ValueError:
+                  return default
+          job = {
+              "title": os.environ.get("SONG_TITLE", "")[:120],
+              "lyrics": os.environ.get("SONG_LYRICS", "")[:4000],
+              "style": (os.environ.get("SONG_STYLE") or "pop")[:40],
+              "custom_style": os.environ.get("SONG_CUSTOM_STYLE", "")[:300],
+              "singer": (os.environ.get("SONG_SINGER") or "female_pop")[:40],
+              "language": (os.environ.get("SONG_LANGUAGE") or "en")[:10],
+              "duration": num("SONG_DURATION", 60, 10, 300),
+              "seed": num("SONG_SEED", 1, 0, 2**32 - 2),
+              "out": "output",
+          }
+          json.dump(job, open("song_job.json", "w"), ensure_ascii=False)
+          PY
+          "$HOME/acestep-local/venv/bin/python" animato-cloud/songgen.py generate --job song_job.json
+          ls -la output
+
+      - name: Attach the song to the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: animato-music-${{ github.run_id }}
+          path: |
+            output/song.mp3
+            output/meta.json
+          retention-days: 3
+          if-no-files-found: error

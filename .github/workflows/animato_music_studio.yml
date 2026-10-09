@@ -1,0 +1,83 @@
+# Animato Studio Pro — music studio session.
+#
+# Installed and kept up to date automatically by the app (edits here are overwritten).
+# While the user is in the music tool, this session keeps the music engine loaded and composes
+# the app's queued songs one after another, so each song only takes the composing time. It polls
+# the app for work, uploads each finished song to the app, and stops after some idle minutes.
+# With warmup=true it only installs and loads the engine once (so it is cached), then stops.
+
+name: Animato Music Studio
+run-name: "Animato music studio"
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_url:
+        description: App URL (the studio polls it for songs)
+        type: string
+        required: true
+      session_token:
+        description: Session secret (set by the app)
+        type: string
+        required: true
+      idle_minutes:
+        description: Stop after this many idle minutes
+        type: string
+        default: '15'
+      warmup:
+        description: Only install + load the engine once (cache it), then stop
+        type: string
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: animato-music-studio
+  cancel-in-progress: true
+
+jobs:
+  studio:
+    name: Music studio
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Hide the session secret
+        run: echo "::add-mask::${{ inputs.session_token }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: animato-cloud
+
+      - name: Add swap (the model is large for a 16 GB machine)
+        run: |
+          sudo fallocate -l 8G /mnt/animato-swap 2>/dev/null && sudo chmod 600 /mnt/animato-swap && sudo mkswap /mnt/animato-swap >/dev/null && sudo swapon /mnt/animato-swap || true
+          free -h; nproc
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache the music engine
+        uses: actions/cache@v4
+        with:
+          path: ~/acestep-local
+          key: animato-acestep-local-v1-${{ runner.os }}
+
+      - name: Install the music engine (first run only)
+        run: bash animato-cloud/music_setup.sh
+
+      - name: Open the studio
+        env:
+          APP_URL: ${{ inputs.app_url }}
+          SESSION_TOKEN: ${{ inputs.session_token }}
+          IDLE_MINUTES: ${{ inputs.idle_minutes }}
+          WARMUP: ${{ inputs.warmup }}
+        run: |
+          "$HOME/acestep-local/venv/bin/python" animato-cloud/songgen.py serve
