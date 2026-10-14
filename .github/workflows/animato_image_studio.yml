@@ -32,7 +32,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: animato-image-studio
+  # One group per session: a new session never cancels a song/picture that is being made
+  # (the old session stops by itself as soon as the app hands its work to the new one).
+  group: animato-image-studio-${{ inputs.session_token }}
   cancel-in-progress: false
 
 jobs:

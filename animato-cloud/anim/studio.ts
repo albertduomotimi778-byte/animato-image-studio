@@ -32,6 +32,8 @@ export interface StudioSpec {
   vignette: number;
   desk: DeskFinish;
   showName: string;
+  /** Deterministic procedural environment selection, 1–1,000,000. */
+  environmentId?: number;
 }
 
 export const STUDIO_PRESETS: { id: StudioPreset; name: string; blurb: string; spec: Omit<StudioSpec, 'showName'> }[] = [
@@ -51,6 +53,18 @@ export function defaultStudio(preset: StudioPreset = 'neon_night', showName = 'T
   return { ...p.spec, showName };
 }
 
+/** Deterministic procedural studio environment. One million IDs produce distinct parameter seeds. */
+export function studioFromEnvironmentId(id: number, showName = 'The Show'): StudioSpec {
+  const n = Math.max(1, Math.min(1_000_000, Math.floor(Number(id) || 1)));
+  const presets = STUDIO_PRESETS;
+  const colours = ['#a855f7','#f59e0b','#06b6d4','#3b82f6','#ef4444','#22c55e','#ec4899','#eab308','#14b8a6','#8b5cf6','#f97316','#d946ef'];
+  const preset = presets[(n - 1) % presets.length];
+  const accent = colours[(n * 17 + Math.floor(n / 13)) % colours.length];
+  const keyColor = colours[(n * 29 + Math.floor(n / 31) + 4) % colours.length];
+  const fraction = (prime: number, mod: number) => ((n * prime) % mod) / (mod - 1);
+  return normalizeStudio({ ...preset.spec, preset: preset.id, accent, keyColor, brightness: 0.55 + fraction(17, 86) * 0.8, haze: fraction(19, 101), bokeh: fraction(23, 101), vignette: fraction(31, 101), desk: (['wood','black','white'] as const)[(n * 7) % 3], showName, environmentId: n });
+}
+
 export function normalizeStudio(input: any): StudioSpec {
   const base = defaultStudio(STUDIO_PRESETS.some((p) => p.id === input?.preset) ? input.preset : 'neon_night');
   return {
@@ -63,6 +77,7 @@ export function normalizeStudio(input: any): StudioSpec {
     vignette: num(input?.vignette, base.vignette, 0, 1),
     desk: ['wood', 'black', 'white'].includes(input?.desk) ? input.desk : base.desk,
     showName: String(input?.showName || base.showName).replace(/[<>&"]/g, '').slice(0, 28) || 'The Show',
+    ...(Number.isInteger(Number(input?.environmentId)) && Number(input.environmentId) >= 1 && Number(input.environmentId) <= 1_000_000 ? { environmentId: Number(input.environmentId) } : {}),
   };
 }
 

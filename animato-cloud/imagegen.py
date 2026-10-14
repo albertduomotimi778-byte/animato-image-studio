@@ -512,7 +512,7 @@ def cmd_studio(args):
         log("warm-up finished: model and upscaler are cached")
         return 0
     threading.Thread(target=init_models, daemon=True).start()
-    _app_call(base, "/api/image/runner/hello", token, {"token": token, "state": "starting"})
+    _app_call(base, "/api/image/runner/hello", token, {"token": token, "state": "loading"})
     idle_limit = max(2, int(args.idle_minutes)) * 60
     last_job = time.time()
     said_ready = False
@@ -522,9 +522,13 @@ def cmd_studio(args):
             _app_call(base, "/api/image/runner/bye", token, {"token": token, "error": STATE["error"]})
             return 1
         if STATE.get("ready") and not said_ready:
+            last_job = time.time()
             _app_call(base, "/api/image/runner/hello", token, {"token": token, "state": "ready", "info": {"profile": LOADED.get("name"), "model": LOADED.get("model")}})
             said_ready = True
         if not STATE.get("ready"):
+            if time.time() - last_job > 25:   # still loading: keep telling the app we are alive
+                _app_call(base, "/api/image/runner/hello", token, {"token": token, "state": "loading"})
+                last_job = time.time()
             time.sleep(1.0)
             continue
         code, data = _app_call(base, "/api/image/runner/next", token)
